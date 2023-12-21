@@ -22,10 +22,10 @@ TEMPLATE = "<s>[INST] Instruction [/INST] Model answer</s>[INST] Follow-up instr
 
 def dataloader(data_dir: Path, batch_size: int, block_size: int, device: int | str, device_type: str):
     dtype = np.int32
-    train_data_x = np.memmap(os.path.join(data_dir, "train_x.bin"), dtype=dtype, mode="r")
-    train_data_y = np.memmap(os.path.join(data_dir, "train_y.bin"), dtype=dtype, mode="r")
-    val_data_x = np.memmap(os.path.join(data_dir, "val_x.bin"), dtype=dtype, mode="r")
-    val_data_y = np.memmap(os.path.join(data_dir, "val_y.bin"), dtype=dtype, mode="r")
+    train_data_x = np.memmap(data_dir / "train_x.bin", dtype=dtype, mode="r")
+    train_data_y = np.memmap(data_dir / "train_y.bin", dtype=dtype, mode="r")
+    val_data_x = np.memmap(data_dir / "val_x.bin", dtype=dtype, mode="r")
+    val_data_y = np.memmap(data_dir / "val_y.bin", dtype=dtype, mode="r")
 
     def get_batch(split):
         data = train_data_x if split == "train" else val_data_x

@@ -33,9 +33,7 @@ MISTRAL_LINKS_MD5 = [
 ]
 
 
-def git_lfs(
-    root: Path = ROOT, repos: List[str] = HF_REPOS, base_url: str = HF_BASE_URL
-):
+def git_lfs(root: Path = ROOT, repos: List[str] = HF_REPOS, base_url: str = HF_BASE_URL):
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(repos)) as executor:
         list(
             executor.map(
@@ -45,9 +43,7 @@ def git_lfs(
         )
 
 
-def download_md5_check_extract_rm(
-    link: str, md5: Optional[str] = None, root: Path = ROOT, rm: bool = False
-):
+def download_md5_check_extract_rm(link: str, md5: Optional[str] = None, root: Path = ROOT, rm: bool = False):
     print("Downloading", link)
     filename = link.split("/")[-1].capitalize()
     foldername = filename.replace(".tar", "")
@@ -67,16 +63,13 @@ def download_md5_check_extract_rm(
         assert not (root / filename).exists()
 
 
-def download_links_md5(
-    links_md5: List[Tuple[str, str]] = MISTRAL_LINKS_MD5, root: Path = ROOT
-):
-    args = [(lm[0], None, root) for lm in links_md5]
+def download_links_md5(links_md5: List[Tuple[str, str]] = MISTRAL_LINKS_MD5, root: Path = ROOT):
+    args = [(lm[0], lm[1], root) for lm in links_md5]
     print("Args", args)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(links_md5)) as executor:
         list(executor.map(lambda x: download_md5_check_extract_rm(*x), args))
 
 
 if __name__ == "__main__":
-    download_links_md5([MISTRAL_LINKS_MD5[1]])
-    # download_links_md5()
+    download_links_md5()
     # nohup python scripts/download.py &
