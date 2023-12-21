@@ -1,16 +1,23 @@
 # Requirements: git-lfs
+from typing import List, Tuple, Optional
 import concurrent.futures
 import os
 import subprocess
 from pathlib import Path
 
+ROOT = Path(os.environ.get("CHECKPOINTS_DIR", "checkpoints"))
+
 # HF
-root = os.environ.get("CHECKPOINTS_DIR", "checkpoints")
-base_url = "https://huggingface.co/"
-repos = ["mistralai/Mixtral-8x7B-Instruct-v0.1/", "mistralai/Mixtral-8x7B-v0.1/"]
+HF_BASE_URL = "https://huggingface.co/"
+HF_REPOS = [
+    "mistralai/Mistral-7B-v0.1",
+    "mistralai/Mistral-7B-Instruct-v0.2",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1/",
+    "mistralai/Mixtral-8x7B-v0.1/",
+]
 
 # Mistral
-links_md5 = [
+MISTRAL_LINKS_MD5 = [
     (
         "https://files.mistral-7b-v0-1.mistral.ai/mistral-7B-v0.1.tar",
         "37dab53973db2d56b2da0a033a15307f",
@@ -26,68 +33,43 @@ links_md5 = [
 ]
 
 
-def git_lfs(root=root, repos=repos, base_url=base_url):
+def git_lfs(root: Path = ROOT, repos: List[str] = HF_REPOS, base_url: str = HF_BASE_URL):
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(repos)) as executor:
         list(
             executor.map(
                 subprocess.run,
-                (
-                    ["git-lfs", "clone", base_url + repo, Path(root) / repo]
-                    for repo in repos
-                ),
+                (["git-lfs", "clone", base_url + repo, root / repo] for repo in repos),
             )
         )
 
 
-def download_mistral_links_md5(root=root, links_md5=links_md5):
+def download_md5_check_extract_rm(link: str, md5: Optional[str] = None, root: Path = ROOT, rm: bool = False):
+    print("Downloading", link)
+    filename = link.split("/")[-1].capitalize()
+    foldername = filename.replace(".tar", "")
+    subprocess.run(["wget", "-c", "-O", root / filename, link])
+    if md5:
+        result = subprocess.run(
+            ["md5sum", "-c", "--status", "--strict", root / filename],
+            capture_output=True,
+            text=True,
+        )
+        md5sum = result.stdout.split()[0]
+        assert md5 == md5sum, f"{md5} != {md5sum}"
+    os.makedirs(root / foldername, exist_ok=True)
+    subprocess.run(["tar", "-xvf", root / filename, "-C", root / foldername])
+    if rm:
+        subprocess.run(["rm", root / filename])
+        assert not (root / filename).exists()
+
+
+def download_links_md5(links_md5: List[Tuple[str, str]] = MISTRAL_LINKS_MD5, root: Path = ROOT):
+    args = [(lm[0], lm[1], root) for lm in links_md5]
+    print("Args", args)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(links_md5)) as executor:
-        list(
-            executor.map(
-                subprocess.run,
-                (
-                    [
-                        "wget",
-                        "-c",
-                        "-O",
-                        Path(root) / link_md5[0].split("/")[-1],
-                        link_md5[0],
-                    ]
-                    for link_md5 in links_md5
-                ),
-            )
-        )
-        list(
-            executor.map(
-                subprocess.run,
-                (
-                    ["md5sum", "-c", "--status", "--strict", Path(root) / link_md5[0]]
-                    for link_md5 in links_md5
-                ),
-            )
-        )
-        list(
-            executor.map(
-                subprocess.run,
-                (
-                    ["tar", "-xvf", Path(root) / link_md5[0].split("/")[-1]]
-                    for link_md5 in links_md5
-                ),
-            )
-        )
-        list(
-            executor.map(
-                subprocess.run,
-                (
-                    ["rm", Path(root) / link_md5[0].split("/")[-1]]
-                    for link_md5 in links_md5
-                ),
-            )
-        )
+        list(executor.map(lambda x: download_md5_check_extract_rm(*x), args))
 
 
 if __name__ == "__main__":
-    from fire import Fire
-
-    Fire(download_mistral_links_md5)
-
+    download_links_md5()
     # nohup python scripts/download.py &
