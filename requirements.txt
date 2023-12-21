@@ -5,3 +5,4 @@ xformers
 simple-parsing
 HolisticTraceAnalysis
 datasets
+tqdm

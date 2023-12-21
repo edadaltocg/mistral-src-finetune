@@ -1,5 +1,5 @@
 # Requirements: git-lfs
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import concurrent.futures
 import os
 import subprocess
@@ -45,26 +45,32 @@ def git_lfs(
         )
 
 
-def download_md5_check_extract_rm(link: str, md5: str, root: Path = ROOT):
+def download_md5_check_extract_rm(
+    link: str, md5: Optional[str] = None, root: Path = ROOT, rm: bool = False
+):
     print("Downloading", link)
     filename = link.split("/")[-1].capitalize()
+    foldername = filename.replace(".tar", "")
     subprocess.run(["wget", "-c", "-O", root / filename, link])
-    result = subprocess.run(
-        ["md5sum", "-c", "--status", "--strict", root / filename],
-        capture_output=True,
-        text=True,
-    )
-    md5sum = result.stdout.split()[0]
-    assert md5 == md5sum, f"{md5} != {md5sum}"
-    subprocess.run(["tar", "-xvf", root / filename])
-    subprocess.run(["rm", root / filename])
-    assert not (root / filename).exists()
+    if md5:
+        result = subprocess.run(
+            ["md5sum", "-c", "--status", "--strict", root / filename],
+            capture_output=True,
+            text=True,
+        )
+        md5sum = result.stdout.split()[0]
+        assert md5 == md5sum, f"{md5} != {md5sum}"
+    os.makedirs(root / foldername, exist_ok=True)
+    subprocess.run(["tar", "-xvf", root / filename, "-C", root / foldername])
+    if rm:
+        subprocess.run(["rm", root / filename])
+        assert not (root / filename).exists()
 
 
 def download_links_md5(
     links_md5: List[Tuple[str, str]] = MISTRAL_LINKS_MD5, root: Path = ROOT
 ):
-    args = [(lm[0], lm[1], root) for lm in links_md5]
+    args = [(lm[0], None, root) for lm in links_md5]
     print("Args", args)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(links_md5)) as executor:
         list(executor.map(lambda x: download_md5_check_extract_rm(*x), args))

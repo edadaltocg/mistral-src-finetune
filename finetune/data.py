@@ -1,63 +1,194 @@
-import sys
-import datasets
-import torch
 import os
-import numpy as np
-from pathlib import Path
-from datasets import load_dataset
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-wd = Path(__file__).parent.parent.resolve()
-sys.path.append(str(wd))
+import numpy as np
+import torch
+from datasets import load_dataset, load_from_disk
+from torch.utils.data import Dataset, random_split
 
 import mistral
+import mistral.tokenizer
 
 
-TEMPLATE = (
-    "<s>[INST] Instruction [/INST] Model answer</s>[INST] Follow-up instruction [/INST]"
-)
+# defaults
+CHECKPOINTS_DIR = Path(os.environ.get("CHECKPOINTS_DIR", "checkpoints"))
+DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 TOKEN = os.environ.get("HF_TOKEN")
 NUM_PROC = os.cpu_count()
-DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
+TEMPLATE = "<s>[INST] Instruction [/INST] Model answer</s>[INST] Follow-up instruction [/INST]"
 
 
-def poorsmans_dataloader(dataset, batch_size, block_size, device, device_type):
-    root = os.environ.get("DATA_DIR", "data")
-    data_dir = os.path.join(root, dataset)
-    train_data = np.memmap(
-        os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r"
-    )
-    val_data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
+def dataloader(data_dir: Path, batch_size: int, block_size: int, device: int | str, device_type: str):
+    dtype = np.int32
+    train_data_x = np.memmap(os.path.join(data_dir, "train_x.bin"), dtype=dtype, mode="r")
+    train_data_y = np.memmap(os.path.join(data_dir, "train_y.bin"), dtype=dtype, mode="r")
+    val_data_x = np.memmap(os.path.join(data_dir, "val_x.bin"), dtype=dtype, mode="r")
+    val_data_y = np.memmap(os.path.join(data_dir, "val_y.bin"), dtype=dtype, mode="r")
 
     def get_batch(split):
-        data = train_data if split == "train" else val_data
+        data = train_data_x if split == "train" else val_data_x
+        labels = train_data_y if split == "train" else val_data_y
         ix = torch.randint(len(data) - block_size, (batch_size,))
-        x = torch.stack(
-            [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
-        )
-        y = torch.stack(
-            [
-                torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64))
-                for i in ix
-            ]
-        )
+        x = torch.stack([torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((labels[i + 1 : i + 1 + block_size]).astype(np.int64)) for i in ix])
         if device_type == "cuda":
             # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(
-                device, non_blocking=True
-            )
+            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
         else:
             x, y = x.to(device), y.to(device)
-        return x, y
+        yield x, y
+
+    return get_batch
 
 
-def _download_alpaca():
+def download_hf_dataset(repo_id: str, data_dir: Path = DATA_DIR, token: str = TOKEN, num_proc: int = NUM_PROC):
+    dataset = load_dataset(repo_id, token=token, num_proc=num_proc)
+    dataset.save_to_disk(data_dir / repo_id)
+    return dataset
+
+
+def get_hf_dataset(repo_id: str, data_dir: Path = DATA_DIR, seed: int = 42):
+    dataset_path = data_dir / repo_id
+    dataset = load_from_disk(str(dataset_path))
+    # shuffle
+    dataset = dataset.shuffle(seed=seed)
+    return dataset
+
+
+def alpaca2messages(data_dir: Path = DATA_DIR) -> List[Dict[str, str]]:
+    """Build messages dataset in memory from Alpaca instructions dataset"""
+    messages = []
+    dataset = get_hf_dataset("tatsu-lab/alpaca", data_dir=data_dir)
+
+    def preprocess_row(row):
+        context = f"{' ' + row['input'] if len(row['input'])>0 else ''}"
+        user = f"{row['instruction']}{context}"
+        assistant = row["output"]
+        return [{"role": "user", "content": user}, {"role": "assistant", "content": assistant}]
+
+    for row in dataset["train"]:
+        messages.extend(preprocess_row(row))
+
+    return messages
+
+
+def build_prompt(msg: Dict[str, str]) -> str:
+    is_user = msg["role"] == "user"
+    content = msg["content"]
+    assert content == content.strip()
+    if is_user:
+        return f"[INST] {content} [/INST]"
+    else:
+        return f" {content}</s>"
+
+
+def messages2examples(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Break messages into ["prompt", "response", "example"]"""
+    examples = []
+    prompt = ""
+    response = ""
+    for i, msg in enumerate(messages):
+        if msg["role"] == "user":
+            prompt = build_prompt(msg)
+        if msg["role"] == "assistant":
+            response = build_prompt(msg)
+        if i % 2 == 1:
+            examples.append({"prompt": prompt, "response": response, "example": prompt + response})
+    return examples
+
+
+def messages2promptstr(messages: List[Dict[str, str]]) -> str:
+    prompt = ""
+    for i, msg in enumerate(messages):
+        prompt += build_prompt(msg)
+    return prompt
+
+
+def examples2tokens(
+    messages: List[Dict[str, str]], tokenizer: mistral.tokenizer.Tokenizer
+) -> Tuple[List[List[int]], List[int]]:
+    input_ids, prompt_lens = [], []
+    for msg in messages:
+        toks = tokenizer.encode(msg["prompt"])
+        assert max(toks) < tokenizer.n_words
+        prompt_lens.append(len(toks))
+        toks = tokenizer.encode(msg["example"])
+        input_ids.append(toks)
+        assert max(toks) < tokenizer.n_words
+
+    return input_ids, prompt_lens
+
+
+def get_supervised_labels(toks: List[List[int]], prompt_lens: List[int], ignore_index: int = -1):
+    labels = []
+    for tok_ids, prompt_len in zip(toks, prompt_lens):
+        tok_ids[:prompt_len] = [ignore_index] * prompt_len
+        labels.append(tok_ids)
+    return labels
+
+
+def prepare_alpaca(
+    model_name: str = "mistralai/Mistral-7B-Instruct-v0.2",
+    checkpoints_dir: str = CHECKPOINTS_DIR,
+    data_dir: Path = DATA_DIR,
+    val_split_fraction: float = 0.03846,
+    seed: int = 42,
+):
+    """
+    Prepare Alpaca instruction dataset.
+
     repo_id = "tatsu-lab/alpaca"
-    dataset = load_dataset(repo_id, token=TOKEN, num_proc=NUM_PROC)
-    dataset.save_to_disk(DATA_DIR / repo_id)
+    Dataset({
+        features: ['instruction', 'input', 'output', 'text', 'text_mistral'],
+        num_rows: 52002
+    })
+
+    The output is a training and val dataset saved as `train.bin` and `val.bin`,
+    which stores the preprocessed and tokenized prompts and labels.
+
+    Assume the dataset and the tokenizer are saved to disk.
+    """
+    # tokenizer
+    tokenizer = mistral.tokenizer.Tokenizer(str(checkpoints_dir / model_name / "tokenizer.model"))
+
+    # load dataset
+    repo_id = "tatsu-lab/alpaca"
+    dataset = get_hf_dataset(repo_id, data_dir=data_dir, seed=seed)
+    dataset = alpaca2messages(data_dir=data_dir)
+    dataset = messages2examples(dataset)
+    input_ids, prompt_lens = examples2tokens(dataset, tokenizer)
+    labels = get_supervised_labels(input_ids, prompt_lens)
+
+    train_index = int(len(input_ids) * (1 - val_split_fraction))
+    train_input_ids, train_labels = input_ids[:train_index], labels[:train_index]
+    val_input_ids, val_labels = input_ids[train_index:], labels[train_index:]
+
+    # flatten
+    all_train_input_ids, all_train_labels = [], []
+    for x, y in zip(train_input_ids, train_labels):
+        all_train_input_ids.extend(x)
+        all_train_labels.extend(y)
+    assert len(all_train_input_ids) == len(all_train_labels)
+    all_val_input_ids, all_val_labels = [], []
+    for x, y in zip(val_input_ids, val_labels):
+        all_val_input_ids.extend(x)
+        all_val_labels.extend(y)
+    assert len(all_val_input_ids) == len(all_val_labels)
+
+    # save to disk
+    dest_folder = data_dir / repo_id / model_name
+    dtype = np.int32
+    os.makedirs(dest_folder, exist_ok=True)
+    np.array(all_train_input_ids, dtype=dtype).tofile(dest_folder / "train_x.bin")
+    np.array(all_train_labels, dtype=dtype).tofile(dest_folder / "train_y.bin")
+    np.array(all_val_input_ids, dtype=dtype).tofile(dest_folder / "val_x.bin")
+    np.array(all_val_labels, dtype=dtype).tofile(dest_folder / "val_y.bin")
 
 
-def _download_mmlu():
+def download_mmlu():
+    # TODO
     repo_id = "lukaemon/mmlu"
     names = [
         "high_school_european_history",
@@ -125,122 +256,6 @@ def _download_mmlu():
     with ThreadPoolExecutor(max_workers=len(names) // 2) as exec:
         datasets = list(exec.map(download, names))
     # concat datasets and save to disk
-    dataset = datasets[0].concatenate(
-        datasets[1:]
-    )  # BUG: : 'DatasetDict' object has no attribute 'concatenate'
+    dataset = datasets[0].concatenate(datasets[1:])  # BUG: : 'DatasetDict' object has no attribute 'concatenate'
 
     dataset.save_to_disk(DATA_DIR / repo_id)
-
-
-def download_datasets():
-    _download_alpaca()
-    _download_mmlu()
-
-
-def prepare_dataset(
-    repo_id: str,
-    tokenizer: mistral.tokenizer.Tokenizer,
-    prompt_template: str,
-):
-    dataset = load_dataset(repo_id, token=os.environ.get("HF_TOKEN"))
-    data = dataset["train"]
-
-
-def prepare_alpaca(
-    # tokenizer: mistral.tokenizer.Tokenizer,
-):
-    """
-    Prepare Alpaca instruction dataset.
-
-    repo_id = "tatsu-lab/alpaca"
-
-
-    Dataset({
-        features: ['instruction', 'input', 'output', 'text', 'text_mistral'],
-        num_rows: 52002
-    })
-
-    The output is a training and test dataset saved as `train.pt` and `test.pt`,
-    which stores the preprocessed and tokenized prompts and labels.
-    """
-    data_dir = Path(os.environ.get("DATA_DIR", "data"))
-    os.makedirs(data_dir, exist_ok=True)
-    print("Data dir", data_dir)
-    repo_id = "tatsu-lab/alpaca"
-    dataset = datasets.load_from_disk(data_dir / repo_id)
-
-    # bos_tok = tokenizer.bos_id
-    # eos_tok = tokenizer.eos_id
-    boi_tok = "[INST]"
-    eoi_tok = "[/INST]"
-    # add new column to the dataset with the formatted instructions
-    dataset = dataset.map(
-        lambda x: {
-            "inst_mistral_x": f"{boi_tok}{x['instruction']}{' ' + x['input'] if len(x['input'])>0 else ''}{eoi_tok}",
-            "inst_mistral_y": f"{x['output']}",
-        }
-    )
-
-    dataset.save_to_disk(data_dir / (repo_id + "_mistral"))
-    print("Example:", dataset["train"][0])
-
-    def prepare_sample(
-        example: dict,
-        tokenizer: Tokenizer,
-        max_length: int,
-        mask_inputs: bool,
-        ignore_index: int,
-    ) -> dict:
-        """Processes a single sample.
-
-        Each sample in the dataset consists of:
-        - instruction: A string describing the task
-        - input: A string holding a special input value for the instruction.
-            This only applies to some samples, and in others this is empty.
-        - output: The response string
-
-        This function processes this data to produce a prompt text and a label for
-        supervised training. The prompt text is formed as a single message including both
-        the instruction and the input. The label/target is the same message but with the
-        response attached.
-
-        Finally, both the prompt and the label get tokenized. If desired, all tokens
-        in the label that correspond to the original input prompt get masked out (default).
-        """
-        full_prompt = generate_prompt(example)
-        full_prompt_and_response = full_prompt + example["output"]
-        encoded_full_prompt = tokenizer.encode(full_prompt, max_length=max_length)
-        encoded_full_prompt_and_response = tokenizer.encode(
-            full_prompt_and_response, eos=True, max_length=max_length
-        )
-
-        # The labels are the full prompt with response, but with the prompt masked out
-        labels = encoded_full_prompt_and_response.clone()
-        if mask_inputs:
-            labels[: len(encoded_full_prompt)] = ignore_index
-
-        return {
-            **example,
-            "input_ids": encoded_full_prompt_and_response,
-            "labels": labels,
-        }
-
-    # tokenize
-    train_bin = data_dir / "train.bin"
-    val_bin = data_dir / "val.bin"
-
-    return dataset
-
-
-def prepare_mmlu():
-    return
-
-
-def prepare_datasets():
-    prepare_alpaca()
-    prepare_mmlu()
-
-
-if __name__ == "__main__":
-    download_datasets()
-    prepare_datasets()
