@@ -70,3 +70,4 @@ def test_dataloader():
             break
     t1 = time.perf_counter()
     print(f"Elapsed time: {(t1 - t0):.4f}s ({max_iters/(t1-t0)} it/s)")
+    # pytest -vvv tests/data.py::test_dataloader -s

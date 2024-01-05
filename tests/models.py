@@ -1,10 +1,12 @@
-import mistral
-from mistral.tokenizer import Tokenizer
-from mistral.model import Transformer
-import finetune
-import pytest
 from pathlib import Path
+
+import pytest
 import torch
+
+import finetune
+import mistral
+from mistral.model import Transformer
+from mistral.tokenizer import Tokenizer
 
 
 @pytest.mark.parametrize("model_name", set("Mistral-7b-v0.2-instruct"))
